@@ -6,3 +6,5 @@
   for = "/*"
   [headers.values]
     Access-Control-Allow-Origin = "*"
+[functions]
+  directory = "netlify/functions"
