@@ -8,7 +8,7 @@ export async function handler(event) {
   const UPLOAD_KEY = process.env.UPLOAD_KEY || "";
   const OWNER = process.env.OWNER;
   const REPO  = process.env.REPO;
-  const BRANCH = process.env.BRANCH || "main";
+  const BRANCH = process.env.REPO_BRANCH || 'main';
   const octo  = new Octokit({ auth: process.env.GITHUB_TOKEN });
 
   // 解析 multipart/form-data
