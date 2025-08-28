@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>上傳照片｜114 實習相簿</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;700;900&display=swap" rel="stylesheet">
+<style>
+  :root{ --bg:#0b0f14; --fg:#e8f0ff; --brand:#00c2ff; --muted:#9aa4b2 }
+  html,body{height:100%;margin:0;background:var(--bg);color:var(--fg);font-family:"Noto Sans TC",system-ui,-apple-system,"Segoe UI",Roboto,"PingFang TC","Microsoft JhengHei",sans-serif}
+  .wrap{max-width:640px;margin:0 auto;padding:24px}
+  h1{font-size:22px;margin:0 0 8px}
+  p.hint{color:var(--muted);margin:0 0 18px}
+  label{display:block;margin:14px 0 6px}
+  input[type="text"],input[type="password"],input[type="file"]{
+    width:100%; box-sizing:border-box; padding:10px 12px; border-radius:8px; border:1px solid #29313a; background:#0f141b; color:var(--fg);
+  }
+  button{margin-top:16px; padding:12px 18px; border:0; border-radius:999px; background:var(--brand); color:#001018; font-weight:900}
+  .msg{margin-top:16px; padding:10px 12px; background:#111825; border:1px solid #263041; border-radius:8px; color:#cde3ff; display:none}
+  .ok{border-color:#194b2e; background:#0f1f16; color:#c8ffd6}
+  .err{border-color:#5d2630; background:#211217; color:#ffd6de}
+  a{color:#7dd3fc}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>上傳照片</h1>
+  <p class="hint">選擇照片、填入標題與上傳金鑰，系統會自動產生連號檔名（001、002…），並寫進 <code>photos.txt</code>。</p>
+
+  <label>上傳金鑰</label>
+  <input id="key" type="password" placeholder="請輸入上傳金鑰">
+
+  <label>照片標題（會顯示在左下角）</label>
+  <input id="title" type="text" placeholder="例如：第一天報到">
+
+  <label>選擇照片（jpg / jpeg / png / webp）</label>
+  <input id="file" type="file" accept="image/*">
+
+  <button id="btn">上傳</button>
+  <div id="msg" class="msg"></div>
+</div>
+
+<script>
+function toBase64(buf){
+  let bin = ""; const bytes = new Uint8Array(buf);
+  for (let i=0;i<bytes.length;i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin);
+}
+function showMsg(text, ok=false){
+  const m = document.getElementById('msg');
+  m.className = 'msg ' + (ok?'ok':'err'); m.style.display='block'; m.innerHTML = text;
+}
+document.getElementById('btn').addEventListener('click', async ()=>{
+  const key = document.getElementById('key').value.trim();
+  const title = document.getElementById('title').value.trim();
+  const f = document.getElementById('file').files[0];
+  if(!key){ showMsg('請填入上傳金鑰'); return; }
+  if(!f){ showMsg('請選擇照片'); return; }
+
+  const ab = await f.arrayBuffer();
+  const base64 = toBase64(ab);
+  const ext = (f.name.split('.').pop()||'jpg').toLowerCase();
+
+  const res = await fetch('/.netlify/functions/upload', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ key, title, ext, contentBase64: base64 })
+  });
+  const j = await res.json().catch(()=>({}));
+  if(res.ok && j.ok){
+    showMsg(`✅ 上傳完成：<b>${j.filename}</b><br>
+      原始檔：<a href="${j.raw}" target="_blank" rel="noreferrer">${j.raw}</a><br>
+      回到相簿：<a href="/" rel="noreferrer">首頁</a>`, true);
+    document.getElementById('file').value = '';
+    document.getElementById('title').value = '';
+  }else{
+    showMsg('❌ 上傳失敗：' + (j.error || res.statusText));
+  }
+});
+</script>
+</body>
+</html>
