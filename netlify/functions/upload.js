@@ -1,132 +1,94 @@
 // netlify/functions/upload.js
-// 簡潔：前端用 JSON 傳 { imageBase64, title, key }，這邊直接處理
-// 會自動找出下一個 3 碼編號，存到 photos/NNN.jpg，並把 "NNN.jpg|標題" 追加到 photos/photos.txt
+exports.handler = async (event) => {
+  const cors = { 'Access-Control-Allow-Origin':'*', 'Access-Control-Allow-Methods':'POST,OPTIONS', 'Access-Control-Allow-Headers':'Content-Type' };
+  if (event.httpMethod === 'OPTIONS') return { statusCode: 204, headers: cors };
 
-const TOKEN  = process.env.GITHUB_TOKEN;
-const OWNER  = process.env.OWNER;
-const REPO   = process.env.REPO;
-const BRANCH = process.env.REPO_BRANCH || "main";
-const UP_KEY = process.env.UPLOAD_KEY;
+  try{
+    const { key, title, contentBase64, ext } = JSON.parse(event.body || '{}');
 
-const GH = "https://api.github.com";
+    if (!key || key !== process.env.UPLOAD_KEY)
+      return { statusCode: 401, headers: cors, body: JSON.stringify({ error:'unauthorized' }) };
 
-function b64(body) {
-  return Buffer.from(body).toString("base64");
-}
-async function gh(path, opts = {}) {
-  const r = await fetch(`${GH}${path}`, {
-    ...opts,
-    headers: {
-      "Authorization": `Bearer ${TOKEN}`,
-      "Accept": "application/vnd.github+json",
-      "X-GitHub-Api-Version": "2022-11-28",
-      ...(opts.headers || {}),
-    },
-  });
-  return r;
-}
-async function getFile(path) {
-  const r = await gh(`/repos/${OWNER}/${REPO}/contents/${encodeURIComponent(path)}?ref=${BRANCH}`);
-  if (r.status === 404) return null;
-  if (!r.ok) throw new Error(`GET ${path} failed: ${r.status}`);
-  const j = await r.json();
-  // content is base64; return {sha, text}
-  const text = Buffer.from(j.content, "base64").toString("utf8");
-  return { sha: j.sha, text };
-}
-async function putFile(path, contentBase64, message, sha) {
-  const body = {
-    message,
-    content: contentBase64,
-    branch: BRANCH,
-    ...(sha ? { sha } : {}),
-  };
-  const r = await gh(`/repos/${OWNER}/${REPO}/contents/${encodeURIComponent(path)}`, {
-    method: "PUT",
-    body: JSON.stringify(body),
-  });
-  if (!r.ok) {
-    const t = await r.text();
-    throw new Error(`PUT ${path} failed: ${r.status} ${t}`);
-  }
-}
+    if (!contentBase64 || !ext)
+      return { statusCode: 400, headers: cors, body: JSON.stringify({ error:'missing file or ext' }) };
 
-// 找目前最大編號（從 photos.txt 或掃描 photos 兩種方式擇一）
-async function nextIndex() {
-  // 先試 photos.txt（效率最好）
-  const txt = await getFile("photos/photos.txt");
-  if (txt && txt.text.trim()) {
-    const max = txt.text
-      .split(/\r?\n/)
-      .map(l => l.trim())
-      .filter(Boolean)
-      .map(l => l.split("|")[0].trim())
-      .map(n => parseInt(n, 10))
-      .filter(n => Number.isFinite(n))
-      .reduce((a, b) => Math.max(a, b), 0);
-    return max + 1;
-  }
-  // 沒有 txt 就從 1 開始
-  return 1;
-}
+    const owner  = process.env.OWNER;
+    const repo   = process.env.REPO;
+    const branch = process.env.REPO_BRANCH || 'main';
+    const token  = process.env.GITHUB_TOKEN;
+    const gh = 'https://api.github.com';
+    const headers = {
+      'Authorization': `Bearer ${token}`,
+      'Accept': 'application/vnd.github+json',
+      'X-GitHub-Api-Version': '2022-11-28'
+    };
 
-export async function handler(event) {
-  try {
-    if (event.httpMethod !== "POST") {
-      return { statusCode: 405, body: "Method Not Allowed" };
+    // 1) 找下一個連號
+    let next = 1;
+    const listRes = await fetch(`${gh}/repos/${owner}/${repo}/contents/photos?ref=${branch}`, { headers });
+    if (listRes.ok) {
+      const arr = await listRes.json();
+      let max = 0;
+      for (const f of arr) {
+        const m = /^(\d{3})\.(jpe?g|png|webp)$/i.exec(f.name);
+        if (m) max = Math.max(max, parseInt(m[1], 10));
+      }
+      next = max + 1;
+    }
+    const num = String(next).padStart(3, '0');
+    const extSafe = ext.toLowerCase().replace(/[^a-z0-9]/g,'');
+    const filename = `${num}.${extSafe}`;
+
+    // 2) 新增影像檔
+    const putImg = await fetch(`${gh}/repos/${owner}/${repo}/contents/photos/${encodeURIComponent(filename)}`, {
+      method: 'PUT', headers,
+      body: JSON.stringify({
+        message: `upload ${filename}`,
+        content: contentBase64,
+        branch
+      })
+    });
+    if (!putImg.ok) {
+      const t = await putImg.text();
+      return { statusCode: 500, headers: cors, body: JSON.stringify({ error:'create image failed', details:t }) };
     }
 
-    const data = JSON.parse(event.body || "{}");
-    const { imageBase64, title = "", key } = data;
-
-    if (!key || key !== UP_KEY) {
-      return { statusCode: 401, body: "Unauthorized" };
+    // 3) 更新 photos.txt
+    let txt = '';
+    let sha = null;
+    const getTxt = await fetch(`${gh}/repos/${owner}/${repo}/contents/photos/photos.txt?ref=${branch}`, { headers });
+    if (getTxt.ok) {
+      const j = await getTxt.json();
+      sha = j.sha;
+      txt = Buffer.from(j.content, 'base64').toString('utf8');
+      if (txt.length && !txt.endsWith('\n')) txt += '\n';
     }
-    if (!imageBase64 || !/^data:image\/(png|jpe?g|webp);base64,/.test(imageBase64)) {
-      return { statusCode: 400, body: "Bad imageBase64" };
+    txt += `${filename}|${title||''}\n`;
+
+    const putTxt = await fetch(`${gh}/repos/${owner}/${repo}/contents/photos/photos.txt`, {
+      method: 'PUT', headers,
+      body: JSON.stringify({
+        message: `append ${filename} to photos.txt`,
+        content: Buffer.from(txt,'utf8').toString('base64'),
+        branch, sha
+      })
+    });
+    if (!putTxt.ok) {
+      const t = await putTxt.text();
+      return { statusCode: 500, headers: cors, body: JSON.stringify({ error:'update photos.txt failed', details:t }) };
     }
 
-    // 取得下一個編號
-    const idx = await nextIndex();
-    const num = String(idx).padStart(3, "0");
-
-    // 決定副檔名（若是 jpeg / png / webp）
-    const ext = (imageBase64.match(/^data:image\/(png|jpe?g|webp)/i)?.[1] || "jpeg")
-      .replace("jpeg", "jpg")
-      .toLowerCase();
-
-    const filename = `${num}.${ext}`;
-    const imgPath  = `photos/${filename}`;
-
-    // 圖檔內容（去掉 dataURL prefix）
-    const base64Payload = imageBase64.replace(/^data:image\/\w+;base64,/, "");
-
-    // 寫入圖片
-    await putFile(
-      imgPath,
-      base64Payload,
-      `upload: add ${filename}`
-    );
-
-    // 追加/建立 photos.txt
-    const row = `${filename}|${title.replace(/\r?\n/g, " ").trim()}`;
-    const prev = await getFile("photos/photos.txt");
-    let newTxt = row + "\n";
-    if (prev && prev.text) newTxt = (prev.text.replace(/\s+$/,"") + "\n" + row + "\n");
-
-    await putFile(
-      "photos/photos.txt",
-      b64(newTxt),
-      `upload: append ${filename} to photos.txt`,
-      prev ? prev.sha : undefined
-    );
-
+    // 4) 回傳成功
     return {
       statusCode: 200,
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ok: true, filename, title, index: num }),
+      headers: cors,
+      body: JSON.stringify({
+        ok:true,
+        filename,
+        raw: `https://raw.githubusercontent.com/${owner}/${repo}/${branch}/photos/${filename}`
+      })
     };
-  } catch (e) {
-    return { statusCode: 500, body: `Error: ${e.message}` };
+  }catch(e){
+    return { statusCode: 500, headers: cors, body: JSON.stringify({ error: e.message || String(e) }) };
   }
-}
+};
