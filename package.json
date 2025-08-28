@@ -1,0 +1,8 @@
+{
+  "name": "ict-uploader",
+  "type": "module",
+  "dependencies": {
+    "octokit": "^4.0.2",
+    "busboy": "^1.6.0"
+  }
+}
