@@ -1,96 +1,132 @@
-import { Octokit } from "octokit";
-import Busboy from "busboy";
+// netlify/functions/upload.js
+// 簡潔：前端用 JSON 傳 { imageBase64, title, key }，這邊直接處理
+// 會自動找出下一個 3 碼編號，存到 photos/NNN.jpg，並把 "NNN.jpg|標題" 追加到 photos/photos.txt
 
-export async function handler(event) {
-  if (event.httpMethod !== "POST")
-    return resp(405, { error: "Method not allowed" });
+const TOKEN  = process.env.GITHUB_TOKEN;
+const OWNER  = process.env.OWNER;
+const REPO   = process.env.REPO;
+const BRANCH = process.env.REPO_BRANCH || "main";
+const UP_KEY = process.env.UPLOAD_KEY;
 
-  const UPLOAD_KEY = process.env.UPLOAD_KEY || "";
-  const OWNER = process.env.OWNER;
-  const REPO  = process.env.REPO;
-  const BRANCH = process.env.REPO_BRANCH || 'main';
-  const octo  = new Octokit({ auth: process.env.GITHUB_TOKEN });
+const GH = "https://api.github.com";
 
-  // 解析 multipart/form-data
-  const files = [];
-  const fields = {};
-  try {
-    await new Promise((resolve, reject) => {
-      const bb = Busboy({ headers: event.headers });
-      bb.on("file", (name, file, info) => {
-        const chunks = [];
-        file.on("data", d => chunks.push(d));
-        file.on("end", () => files.push({ filename: info.filename, buffer: Buffer.concat(chunks) }));
-      });
-      bb.on("field", (name, val) => (fields[name] = val));
-      bb.on("close", resolve);
-      bb.on("error", reject);
-      bb.end(Buffer.from(event.body, event.isBase64Encoded ? "base64" : "utf8"));
-    });
-  } catch {
-    return resp(400, { error: "Malformed form data" });
-  }
-
-  if (UPLOAD_KEY && fields.key !== UPLOAD_KEY) return resp(401, { error: "Invalid key" });
-  if (!files.length) return resp(400, { error: "No files" });
-
-  // 找目前最大編號
-  let max = 0;
-  const tree = await octo.request("GET /repos/{owner}/{repo}/git/trees/{ref}?recursive=1", {
-    owner: OWNER, repo: REPO, ref: BRANCH
+function b64(body) {
+  return Buffer.from(body).toString("base64");
+}
+async function gh(path, opts = {}) {
+  const r = await fetch(`${GH}${path}`, {
+    ...opts,
+    headers: {
+      "Authorization": `Bearer ${TOKEN}`,
+      "Accept": "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28",
+      ...(opts.headers || {}),
+    },
   });
-  for (const t of tree.data.tree) {
-    if (t.path?.startsWith("photos/") && /^\d{3}\.(jpg|jpeg|png|webp)$/i.test(t.path)) {
-      const n = parseInt(t.path.slice(7,10), 10); if (n > max) max = n;
-    }
-  }
-
-  // 讀/建 photos.txt
-  const TXT = "photos/photos.txt";
-  let txtSHA = null, txtContent = "";
-  try {
-    const r = await octo.request("GET /repos/{owner}/{repo}/contents/{path}", {
-      owner: OWNER, repo: REPO, path: TXT, ref: BRANCH
-    });
-    txtSHA = r.data.sha;
-    txtContent = Buffer.from(r.data.content, "base64").toString("utf8");
-  } catch {}
-
-  const saved = [];
-  for (let i = 0; i < files.length; i++) {
-    const f = files[i];
-    const next = String(++max).padStart(3, "0");
-    const ext  = (f.filename.split(".").pop() || "jpg").toLowerCase();
-    const saveAs = `photos/${next}.${ext}`;
-    const title = (fields[`title_${i}`] || next).trim();
-
-    // 上傳檔案
-    await octo.request("PUT /repos/{owner}/{repo}/contents/{path}", {
-      owner: OWNER, repo: REPO, path: saveAs, branch: BRANCH,
-      message: `upload: ${saveAs}`,
-      content: f.buffer.toString("base64")
-    });
-
-    // 追加一行
-    const newline = `${next}.${ext}|${title}\n`;
-    txtContent = (txtContent ? txtContent.replace(/\s*$/,'') + "\n" : "") + newline;
-    saved.push(saveAs);
-  }
-
-  // 寫回 photos.txt
-  await octo.request("PUT /repos/{owner}/{repo}/contents/{path}", {
-    owner: OWNER, repo: REPO, path: TXT, branch: BRANCH, sha: txtSHA,
-    message: "append: update photos.txt",
-    content: Buffer.from(txtContent, "utf8").toString("base64")
+  return r;
+}
+async function getFile(path) {
+  const r = await gh(`/repos/${OWNER}/${REPO}/contents/${encodeURIComponent(path)}?ref=${BRANCH}`);
+  if (r.status === 404) return null;
+  if (!r.ok) throw new Error(`GET ${path} failed: ${r.status}`);
+  const j = await r.json();
+  // content is base64; return {sha, text}
+  const text = Buffer.from(j.content, "base64").toString("utf8");
+  return { sha: j.sha, text };
+}
+async function putFile(path, contentBase64, message, sha) {
+  const body = {
+    message,
+    content: contentBase64,
+    branch: BRANCH,
+    ...(sha ? { sha } : {}),
+  };
+  const r = await gh(`/repos/${OWNER}/${REPO}/contents/${encodeURIComponent(path)}`, {
+    method: "PUT",
+    body: JSON.stringify(body),
   });
-
-  return resp(200, { ok: true, files: saved });
+  if (!r.ok) {
+    const t = await r.text();
+    throw new Error(`PUT ${path} failed: ${r.status} ${t}`);
+  }
 }
 
-function resp(code, obj) {
-  return {
-    statusCode: code,
-    headers: { "content-type": "application/json; charset=utf-8", "access-control-allow-origin": "*" },
-    body: JSON.stringify(obj)
-  };
+// 找目前最大編號（從 photos.txt 或掃描 photos 兩種方式擇一）
+async function nextIndex() {
+  // 先試 photos.txt（效率最好）
+  const txt = await getFile("photos/photos.txt");
+  if (txt && txt.text.trim()) {
+    const max = txt.text
+      .split(/\r?\n/)
+      .map(l => l.trim())
+      .filter(Boolean)
+      .map(l => l.split("|")[0].trim())
+      .map(n => parseInt(n, 10))
+      .filter(n => Number.isFinite(n))
+      .reduce((a, b) => Math.max(a, b), 0);
+    return max + 1;
+  }
+  // 沒有 txt 就從 1 開始
+  return 1;
+}
+
+export async function handler(event) {
+  try {
+    if (event.httpMethod !== "POST") {
+      return { statusCode: 405, body: "Method Not Allowed" };
+    }
+
+    const data = JSON.parse(event.body || "{}");
+    const { imageBase64, title = "", key } = data;
+
+    if (!key || key !== UP_KEY) {
+      return { statusCode: 401, body: "Unauthorized" };
+    }
+    if (!imageBase64 || !/^data:image\/(png|jpe?g|webp);base64,/.test(imageBase64)) {
+      return { statusCode: 400, body: "Bad imageBase64" };
+    }
+
+    // 取得下一個編號
+    const idx = await nextIndex();
+    const num = String(idx).padStart(3, "0");
+
+    // 決定副檔名（若是 jpeg / png / webp）
+    const ext = (imageBase64.match(/^data:image\/(png|jpe?g|webp)/i)?.[1] || "jpeg")
+      .replace("jpeg", "jpg")
+      .toLowerCase();
+
+    const filename = `${num}.${ext}`;
+    const imgPath  = `photos/${filename}`;
+
+    // 圖檔內容（去掉 dataURL prefix）
+    const base64Payload = imageBase64.replace(/^data:image\/\w+;base64,/, "");
+
+    // 寫入圖片
+    await putFile(
+      imgPath,
+      base64Payload,
+      `upload: add ${filename}`
+    );
+
+    // 追加/建立 photos.txt
+    const row = `${filename}|${title.replace(/\r?\n/g, " ").trim()}`;
+    const prev = await getFile("photos/photos.txt");
+    let newTxt = row + "\n";
+    if (prev && prev.text) newTxt = (prev.text.replace(/\s+$/,"") + "\n" + row + "\n");
+
+    await putFile(
+      "photos/photos.txt",
+      b64(newTxt),
+      `upload: append ${filename} to photos.txt`,
+      prev ? prev.sha : undefined
+    );
+
+    return {
+      statusCode: 200,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ok: true, filename, title, index: num }),
+    };
+  } catch (e) {
+    return { statusCode: 500, body: `Error: ${e.message}` };
+  }
 }
